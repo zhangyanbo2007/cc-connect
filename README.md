@@ -190,7 +190,7 @@ MiniMax-M2.7 is a next-generation large language model designed for autonomous e
 
 - **`/fork`** — Branch a conversation at a specific turn into a new side session. Original session stays untouched. Auto-names `fork 1 of <currentName>`. Card-based selection on Feishu/Slack/Telegram.
 - **`/rollback`** — Remove the last N turns from the current session, truncating agent context. Card selection or `/rollback N` directly.
-- **Session name preservation** — Rollback truncation re-writes `custom-title` to JSONL, preventing VSCode from reverting to a stale name.
+- **Session name sync** — Feishu `/name` changes sync instantly to VSCode/CLI; names stay intact after rollback too.
 - *Full docs → [docs/fork-rollback.md](docs/fork-rollback.md)*
 
 
