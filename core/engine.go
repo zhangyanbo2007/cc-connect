@@ -4716,6 +4716,7 @@ var builtinCommands = []struct {
 	{[]string{"dir", "cd", "chdir", "workdir"}, "dir"},
 	{[]string{"tts"}, "tts"},
 	{[]string{"workspace", "ws"}, "workspace"},
+	{[]string{"project", "pj"}, "project"},
 	{[]string{"whoami", "myid"}, "whoami"},
 	{[]string{"web"}, "web"},
 	{[]string{"diff"}, "diff"},
@@ -4932,6 +4933,9 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 			return true
 		}
 		e.handleWorkspaceCommand(p, msg, args)
+		return true
+	case "project":
+		e.cmdProject(p, msg, args)
 		return true
 	case "whoami":
 		e.cmdWhoami(p, msg)
@@ -7693,7 +7697,7 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 		target = resolveModelSwitchTarget(target, models)
 	}
 
-	target, err = e.switchModelOnAgent(agent, target, agent == e.agent)
+	target, err = e.switchModelOnAgent(agent, target, false)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChangeFailed, err))
 		return
@@ -7801,22 +7805,20 @@ func (e *Engine) switchModelOnAgent(agent Agent, target string, persistConfig bo
 
 	providers := providerSwitcher.ListProviders()
 	updated, found := SetProviderModel(providers, active.Name, target)
-	if !found {
+	if found {
+		// Always apply to runtime state regardless of persistence.
+		providerSwitcher.SetProviders(updated)
 		switcher.SetModel(target)
-		return target, nil
-	}
-	if !persistConfig {
-		switcher.SetModel(target)
-		return target, nil
-	}
-	if persistConfig && e.providerModelSaveFunc != nil {
-		if err := e.providerModelSaveFunc(active.Name, target); err != nil {
-			return "", fmt.Errorf("save provider model %q: %w", active.Name, err)
+		providerSwitcher.SetActiveProvider(active.Name)
+		// Only persist to disk when requested.
+		if persistConfig && e.providerModelSaveFunc != nil {
+			if err := e.providerModelSaveFunc(active.Name, target); err != nil {
+				return "", fmt.Errorf("save provider model %q: %w", active.Name, err)
+			}
 		}
+		return target, nil
 	}
-	providerSwitcher.SetProviders(updated)
 	switcher.SetModel(target)
-	providerSwitcher.SetActiveProvider(active.Name)
 	return target, nil
 }
 
@@ -9452,6 +9454,10 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		return e.handleModelCardAction(args, sessionKey)
 	}
 
+	if prefix == "act" && cmd == "/project" {
+		return e.handleProjectCardAction(args, sessionKey)
+	}
+
 	if prefix == "act" {
 		e.executeCardAction(cmd, args, sessionKey)
 	}
@@ -9469,6 +9475,8 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		return e.renderLangCard()
 	case "/fork":
 		return e.renderForkCardFromState(sessionKey)
+	case "/project":
+		return e.renderProjectCard(sessionKey)
 	case "/status":
 		return e.renderStatusCard(sessionKey, extractUserID(sessionKey))
 	case "/list":
@@ -9590,7 +9598,7 @@ func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 		cancel()
 	}
 
-	resolved, err := e.switchModelOnAgent(agent, target, agent == e.agent)
+	resolved, err := e.switchModelOnAgent(agent, target, false)
 	e.cleanupInteractiveState(e.interactiveKeyForSessionKey(sessionKey))
 	if err == nil {
 		sessions.Save()
@@ -10242,7 +10250,7 @@ func (e *Engine) pushDeleteModeResultCard(sessionKey string) {
 }
 
 func (e *Engine) performModelSwitchAsync(sessionKey string, state *interactiveState, agent Agent, sessions *SessionManager, target string) {
-	resolved, err := e.switchModelOnAgent(agent, target, agent == e.agent)
+	resolved, err := e.switchModelOnAgent(agent, target, false)
 	if err == nil {
 		sessions.Save()
 	}
@@ -14394,3 +14402,277 @@ func (e *Engine) cmdWebStatus(p Platform, msg *Message) {
 	}
 	e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgWebStatus), url))
 }
+
+// --- /project command: switch shared feishu app between projects ---
+
+// sharedFeishuAppID identifies the feishu app that can be moved between projects.
+const sharedFeishuAppID = "cli_a93223c12eb8dcc4"
+
+// projectSwitcherProject is the only project allowed to invoke /project.
+// This command is designed for the privacy-engineering project which has a
+// separate feishu app and can control where the shared feishu app is bound.
+const projectSwitcherProject = "privacy-engineering"
+
+// projectBaseDir is the parent directory containing project subdirectories.
+const projectBaseDir = "/home/zhangyanbo/owner/xiaowangzi/projects"
+
+// projectRootDir is the root xiaowangzi directory (also a valid target).
+const projectRootDir = "/home/zhangyanbo/owner/xiaowangzi"
+
+// cmdProject handles the /project slash command.
+// Only the projectSwitcherProject can use it; other projects get a rejection message.
+func (e *Engine) cmdProject(p Platform, msg *Message, args []string) {
+	if e.ProjectName() != projectSwitcherProject {
+		e.reply(p, msg.ReplyCtx, "This command is only available in the "+projectSwitcherProject+" project.")
+		return
+	}
+
+	if supportsCards(p) {
+		e.replyWithCard(p, msg.ReplyCtx, e.renderProjectCard(msg.SessionKey))
+		return
+	}
+
+	// Fallback for platforms without card support: plain text list
+	projects := e.listProjectOptions()
+	var sb strings.Builder
+	sb.WriteString("Available projects to switch to:\n")
+	for _, prj := range projects {
+		sb.WriteString(fmt.Sprintf("- %s (/project %s)\n", prj.DisplayName, prj.Name))
+	}
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+// projectOption represents a selectable project in the /project card.
+type projectOption struct {
+	Name        string // project name in config.toml (e.g. "xiaowangzi")
+	DisplayName string // display label for the card (e.g. "xiaowangzi (root)")
+	WorkDir     string // work_dir path
+}
+
+// listProjectOptions scans available projects that can receive the shared feishu app.
+// Returns xiaowangzi root + projects/ subdirectories, excluding privacy-engineering.
+func (e *Engine) listProjectOptions() []projectOption {
+	var options []projectOption
+
+	// Always include xiaowangzi root
+	options = append(options, projectOption{
+		Name:        "xiaowangzi",
+		DisplayName: "xiaowangzi (root)",
+		WorkDir:     projectRootDir,
+	})
+
+	// Scan projects/ subdirectories
+	entries, err := os.ReadDir(projectBaseDir)
+	if err != nil {
+		slog.Warn("project: failed to scan project directories", "dir", projectBaseDir, "error", err)
+		return options
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if name == projectSwitcherProject {
+			continue // exclude privacy-engineering
+		}
+		// Skip hidden directories
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		options = append(options, projectOption{
+			Name:        name,
+			DisplayName: name,
+			WorkDir:     filepath.Join(projectBaseDir, name),
+		})
+	}
+
+	return options
+}
+
+// renderProjectCard builds a card with project options.
+// Each option is a CardListItem with a button whose value is act:/project switch <name>.
+func (e *Engine) renderProjectCard(sessionKey string) *Card {
+	options := e.listProjectOptions()
+
+	var sb strings.Builder
+	sb.WriteString("Select a project to switch the shared Feishu app to.\n\n")
+	sb.WriteString("Current project: **" + e.ProjectName() + "**\n")
+
+	cb := NewCard().Title("Project Switch", "blue").Markdown(sb.String())
+
+	for _, opt := range options {
+		btnValue := "act:/project switch " + opt.Name
+		cb.ListItemBtn(opt.DisplayName, "Switch", "primary", btnValue)
+	}
+
+	cb.Buttons(DefaultBtn("Back", "nav:/help"))
+	return cb.Build()
+}
+
+// handleProjectCardAction handles act:/project switch actions from the card.
+// It modifies config.toml to move the shared feishu platform block to the target project,
+// then spawns a background process to restart cc-connect.
+func (e *Engine) handleProjectCardAction(args, sessionKey string) *Card {
+	targetName := strings.TrimSpace(args)
+	if targetName == "" {
+		return e.simpleCard("Project Switch", "red", "No project name specified.")
+	}
+
+	// Validate target exists in options
+	options := e.listProjectOptions()
+	valid := false
+	for _, opt := range options {
+		if opt.Name == targetName {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return e.simpleCard("Project Switch", "red", "Unknown project: "+targetName)
+	}
+
+	// Read current config.toml
+	configPath, _ := filepath.Abs(filepath.Join(os.Getenv("HOME"), ".cc-connect", "config.toml"))
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		slog.Error("project: failed to read config", "path", configPath, "error", err)
+		return e.simpleCard("Project Switch", "red", "Failed to read config file.")
+	}
+
+	// Define the shared platform block as a string
+	sharedPlatformBlock := "\n[[projects.platforms]]\n" +
+		"type = \"feishu\"\n\n" +
+		"[projects.platforms.options]\n" +
+		"app_id = \"" + sharedFeishuAppID + "\"\n" +
+		"app_secret = \"eLGghTZUM3KG2UobbjeobbolMlN3tbsv\"\n" +
+		"allow_from = \"*\"\n" +
+		"group_reply_all = true\n"
+
+	// Find and remove the existing shared platform block
+	// The block is identifiable by the app_id line
+	appIDMarker := "app_id = \"" + sharedFeishuAppID + "\""
+	newContent := removeSharedPlatformBlock(string(content), appIDMarker, sharedPlatformBlock)
+
+	// Insert the platform block after the target project's last section
+	newContent = insertPlatformAfterProject(newContent, targetName, sharedPlatformBlock)
+
+	// Write the modified config
+	if err := os.WriteFile(configPath, []byte(newContent), 0644); err != nil {
+		slog.Error("project: failed to write config", "path", configPath, "error", err)
+		return e.simpleCard("Project Switch", "red", "Failed to write config file.")
+	}
+
+	// Spawn background restart process
+	// Use a small delay so the card response can be sent before the process is killed
+	restartCmd := exec.Command("sh", "-c",
+		"sleep 2 && rm -f ~/.cc-connect/.config.toml.lock && pkill -x cc-connect && sleep 1 && cc-connect &")
+	if err := restartCmd.Start(); err != nil {
+		slog.Error("project: failed to spawn restart", "error", err)
+	}
+
+	slog.Info("project: switching shared feishu app", "target", targetName)
+	return NewCard().Title("Project Switch", "green").
+		Markdown("Switching shared Feishu app to **" + targetName + "**.\ncc-connect will restart in ~3 seconds.").
+		Build()
+}
+
+// removeSharedPlatformBlock removes the [[projects.platforms]] block that contains
+// the shared feishu app_id from the TOML content.
+func removeSharedPlatformBlock(content, appIDMarker, blockTemplate string) string {
+	// Find the line containing the shared app_id
+	lines := strings.Split(content, "\n")
+	markerIdx := -1
+	for i, line := range lines {
+		if strings.Contains(line, appIDMarker) {
+			markerIdx = i
+			break
+		}
+	}
+	if markerIdx == -1 {
+		return content // no shared platform block found
+	}
+
+	// Find the start of the platform block: scan backwards for [[projects.platforms]]
+	blockStart := markerIdx
+	for i := markerIdx - 1; i >= 0; i-- {
+		if strings.HasPrefix(strings.TrimSpace(lines[i]), "[[projects.platforms]]") {
+			blockStart = i
+			break
+		}
+	}
+
+	// Find the end of the platform block: scan forward for the next section header or [[projects]]
+	blockEnd := markerIdx
+	for i := markerIdx + 1; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed == "" {
+			continue // skip blank lines within block
+		}
+		if strings.HasPrefix(trimmed, "[[") || strings.HasPrefix(trimmed, "[") {
+			blockEnd = i - 1
+			break
+		}
+		blockEnd = i
+	}
+
+	// Include trailing blank lines after the block
+	whileBlank := blockEnd + 1
+	for whileBlank < len(lines) && strings.TrimSpace(lines[whileBlank]) == "" {
+		whileBlank++
+	}
+
+	// Remove the block (from blockStart to whileBlank-1)
+	newLines := make([]string, 0, len(lines))
+	newLines = append(newLines, lines[:blockStart]...)
+	newLines = append(newLines, lines[whileBlank:]...)
+	return strings.Join(newLines, "\n")
+}
+
+// insertPlatformAfterProject inserts the shared platform block after the target
+// project's last section, before the next [[projects]] definition.
+func insertPlatformAfterProject(content, targetName, platformBlock string) string {
+	// Find the target project definition: [[projects]] followed by name = "targetName"
+	lines := strings.Split(content, "\n")
+
+	// Find the line: name = "targetName"
+	targetNameLine := -1
+	for i, line := range lines {
+		if strings.Contains(line, "name = \""+targetName+"\"") {
+			targetNameLine = i
+			break
+		}
+	}
+	if targetNameLine == -1 {
+		return content // target project not found
+	}
+
+	// Find the next [[projects]] line after the target project
+	nextProjectLine := -1
+	for i := targetNameLine + 1; i < len(lines); i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "[[projects]]") {
+			nextProjectLine = i
+			break
+		}
+	}
+
+	// If no next project, insert at the end of the file
+	if nextProjectLine == -1 {
+		nextProjectLine = len(lines)
+	}
+
+	// Skip any blank lines immediately before the next project section
+	insertPoint := nextProjectLine
+	for insertPoint > 0 && strings.TrimSpace(lines[insertPoint-1]) == "" {
+		insertPoint--
+	}
+
+	// Insert the platform block
+	newLines := make([]string, 0, len(lines)+20)
+	newLines = append(newLines, lines[:insertPoint]...)
+	newLines = append(newLines, strings.Split(platformBlock, "\n")...)
+	newLines = append(newLines, lines[insertPoint:]...)
+	return strings.Join(newLines, "\n")
+}
+
+// simpleCard creates a minimal card with a title, color, and markdown text.

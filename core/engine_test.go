@@ -3794,8 +3794,9 @@ func TestCmdModel_UpdatesActiveProviderModel(t *testing.T) {
 	if got := agent.GetModel(); got != "gpt-4.1" {
 		t.Fatalf("GetModel() = %q, want gpt-4.1", got)
 	}
-	if savedProvider != "openai" || savedModel != "gpt-4.1" {
-		t.Fatalf("saved provider/model = %q/%q, want openai/gpt-4.1", savedProvider, savedModel)
+	// Model switch is session-local (no persistence), so save func should NOT be called.
+	if savedProvider != "" || savedModel != "" {
+		t.Fatalf("saved provider/model = %q/%q, want empty (session-local only)", savedProvider, savedModel)
 	}
 	if active := e.sessions.GetOrCreateActive(msg.SessionKey); active.AgentSessionID != "existing-session" {
 		t.Fatalf("session id = %q, want preserved after model switch", active.AgentSessionID)
@@ -4004,11 +4005,13 @@ func TestCmdModel_MultiWorkspaceSwitchDoesNotMutateProviderModel(t *testing.T) {
 
 	e.cmdModel(p, msg, []string{"switch", "gpt"})
 
+	// Workspace model switch updates runtime state (agent model + provider model)
+	// but does NOT persist to disk.
 	if wsAgent.model != "gpt-4.1" {
 		t.Fatalf("workspace agent model = %q, want gpt-4.1", wsAgent.model)
 	}
-	if got := wsAgent.GetActiveProvider(); got == nil || got.Model != "gpt-4.1-mini" {
-		t.Fatalf("workspace active provider = %#v, want unchanged model gpt-4.1-mini", got)
+	if got := wsAgent.GetActiveProvider(); got == nil || got.Model != "gpt-4.1" {
+		t.Fatalf("workspace active provider model = %q, want gpt-4.1", got.Model)
 	}
 }
 
